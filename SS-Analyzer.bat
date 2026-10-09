@@ -1,6 +1,6 @@
 @echo off
 rem SS Analyzer launcher: checks Python + deps, runs first-time setup, starts app.
-rem Keys + models live in config.json (created on first run — never shipped).
+rem Keys + models live in config.json (created on first run - never shipped).
 cd /d "%~dp0"
 set "PY="
 for /f "delims=" %%P in ('where python 2^>nul') do (
@@ -20,7 +20,7 @@ if errorlevel 1 (
 )
 "%PY%" -c "import PySide6, PIL.Image, requests" 2>nul
 if errorlevel 1 (
-    echo [SS Analyzer] Installing dependencies, one time only (~150 MB)...
+    echo [SS Analyzer] Installing dependencies, one time only, about 150 MB...
     "%PY%" -m pip install -r "%~dp0requirements.txt"
     if errorlevel 1 (
         echo [SS Analyzer] Install failed. Check your network, then double-click again.
