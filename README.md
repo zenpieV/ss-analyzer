@@ -15,7 +15,7 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
 
 - Hotkey: **Ctrl + LeftAlt + J** (left-Alt enforced; right-Alt alone is ignored)
 - Providers:
-  - **Gemini direct** (free key): `gemini-2.5-flash-lite` default.
+  - **Gemini direct** (free key): `gemini-3.5-flash-lite` default.
   - **OpenCode Go** (Go key): 36 image-input models — MiniMax M3/M2.7/M2.5, Kimi K3/K2.7-Code/K2.6/K2.5,
     GLM 5/5.1/5.2/5.3/5.3-Flash, Qwen3.5-Plus through 3.8-Max, MiMo V2 family,
     DeepSeek V4 Flash Vision, Grok 4.5/4.6/4.7, GPT 6-Luna/5.6-Luna,
@@ -85,8 +85,9 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
 - Windows `RegisterHotKey` cannot distinguish left/right Alt by itself, so the app
   checks `GetAsyncKeyState(VK_LMENU)` on fire and ignores right-Alt-only presses.
 - Multi-monitor + DPI: capture uses Pillow `ImageGrab(all_screens=True)` in global coords.
-- Requested "3.5 flash lite": no such public model id; mapped to `gemini-2.5-flash-lite`.
-  If Google ships a `gemini-3.5-flash-lite` id, change one line in `config.json`.
+- Default Gemini model is `gemini-3.5-flash-lite` (Google gates the 2.5 ids to
+  past users; 3.5 Flash-Lite is the free-tier replacement). Override per install
+  in `config.json` if Google ships a newer free id.
 - Go vision list is curated: the live catalog (`GET /zen/go/v1/models`, public,
   snapshot in `go_models_live.json`) carries no capability flags, so 12 Go ids
   with no public image-input claim are excluded (DeepSeek non-vision V4s,

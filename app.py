@@ -34,7 +34,7 @@ VK_J = 0x4A
 VK_LMENU = 0xA4  # left Alt
 WM_HOTKEY = 0x0312
 
-DEFAULT_MODEL = "gemini-2.5-flash-lite"  # user asked "3.5 flash lite"; closest free Flash-Lite id, overridable
+DEFAULT_MODEL = "gemini-3.5-flash-lite"  # free-tier Flash-Lite id (2.5 ids are gated to past users), overridable
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 # ---------------------------------------------------------------- OpenCode Go
