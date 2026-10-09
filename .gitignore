@@ -1,0 +1,8 @@
+# Personal / generated — never commit or ship.
+config.json
+settings.json
+analyses.md
+crash.log
+snips/
+__pycache__/
+*.zip
