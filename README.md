@@ -16,14 +16,14 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
 - Hotkey: **Ctrl + LeftAlt + J** (left-Alt enforced; right-Alt alone is ignored)
 - Providers:
   - **Gemini direct** (free key): `gemini-2.5-flash-lite` default.
-  - **OpenCode Go** (Go key): 33 image-input models — MiniMax M3/M2.7/M2.5, Kimi K3/K2.7-Code/K2.6/K2.5,
+  - **OpenCode Go** (Go key): 36 image-input models — MiniMax M3/M2.7/M2.5, Kimi K3/K2.7-Code/K2.6/K2.5,
     GLM 5/5.1/5.2/5.3/5.3-Flash, Qwen3.5-Plus through 3.8-Max, MiMo V2 family,
     DeepSeek V4 Flash Vision, Grok 4.5/4.6/4.7, GPT 6-Luna/5.6-Luna,
     Claude Haiku 5.5, Muse Spark 1.2/1.3.
     Free with image input (all three verified live with image probes):
     LongCat 2.5 Preview Free, Step 5 Preview Free, Space Bunny Free.
   - Go wire protocol is per-model (from the Go docs endpoint table):
-    chat/completions ×16, responses ×7, messages ×10. Effort-low mapping:
+    chat/completions ×19, responses ×7, messages ×10. Effort-low mapping:
     `reasoning_effort`/`reasoning.effort=low` on chat+responses (bare retry on 400),
     tight `max_tokens` cap on messages. Every Go request sends a stable
     `x-opencode-session` id (one per app run, for gateway routing/cache) and
@@ -32,7 +32,7 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
   (family-separated, exclusive). Switching applies to the next analysis and
   persists to `config.json` (selection fields only — your keys/model list are yours).
 - Overlay themes (tray right-click **Theme** submenu ONLY — nothing in the overlay,
-  60 total). Classics: Obsidian Glass, Clawd Terminal, YoRHa, stdout, Receipt,
+  65 total). Classics: Obsidian Glass, Clawd Terminal, YoRHa, stdout, Receipt,
   Brutalist, Miku, Girly-Pop, Overload, Doge, Amogus, 404, Comic Sans, Bug,
   CRT, Blueprint, Noir, Arcade, Zen, Solarized, ADA, Win95, Hologram,
   Field Notes. Fandoms: Elden Ring, Hollow Knight, Sekiro, Minecraft,
@@ -47,9 +47,10 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
   `python app.py --theme yorha`. Full catalogue + build order: `THEMES.md`.
 - Cut-off header text scrolls automatically (marquee with end pauses).
   Footer button labels are kept short per theme so they always fit — no scrolling there.
-- Thinking models get room: Go output budgets start at 4096 tokens with one
-  escalation retry, then a thinking-trace fallback instead of FAILED.
-  Flapping 429s get one automatic retry after 20s; analyses run on daemon
+- Thinking models get room: output budgets escalate (Go 4096→16384,
+  Gemini 1024→4096→8192), then a thinking-trace fallback instead of FAILED.
+  Flapping 429s carry an actionable message (auto-retry exists but is
+  currently disabled via `GO_429_RETRY_SECONDS`); analyses run on daemon
   workers, so quitting or re-snipping mid-run can never take the app down
   (stale results are dropped).
 - Reasoning-model quirks handled generically: any 400 naming an unsupported

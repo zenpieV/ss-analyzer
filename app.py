@@ -118,9 +118,8 @@ GO_VISION_MODELS = [  # (model id, switcher label) — image-input capable
 # Add any of these via config.json override once verified.
 GO_EXCLUDED_UNCERTAIN = [
     "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash",
-    "deepseek-v4.1-flash", "longcat-2.0", "longcat-2.5-preview-free",
-    "step-5-preview-free", "hy4-preview", "hy3", "hy3-preview",
-    "omen-alpha", "space-bunny",
+    "deepseek-v4.1-flash", "longcat-2.0",
+    "hy4-preview", "hy3", "hy3-preview", "omen-alpha",
 ]
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -203,7 +202,9 @@ def probe_gemini_key(key, timeout=30):
 
 
 def probe_go_key(key, timeout=45):
-    return analyze_with_go(_probe_image(), key, "minimax-m3",
+    chat_model = next((mid for mid, _ in GO_VISION_MODELS
+                       if go_endpoint_for(mid) == "chat"), "minimax-m3")
+    return analyze_with_go(_probe_image(), key, chat_model,
                            "Reply with exactly: OK", "Reply with exactly: OK",
                            session_id="ss-analyzer-setup", timeout=timeout)
 
@@ -317,8 +318,11 @@ def append_log(path, model, bbox, image_path, prompt, output, error=None, provid
         f"- prompt: {prompt}\n\n"
         f"```text\n{(error or output or '(empty)').strip()}\n```\n\n---\n"
     )
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(entry)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception as e:
+        print(f"[log] warning: cannot append to log: {e}")
     return path
 
 
@@ -331,53 +335,62 @@ def analyze_with_gemini(image_bytes, api_key, model, system_prompt, user_prompt,
                            "(restart terminal), or put it in config.json > gemini_api_key.")
     url = GEMINI_URL.format(model=model) + f"?key={api_key}"
     b64 = base64.b64encode(image_bytes).decode("ascii")
-    bodies = [
-        {  # attempt 1: system_instruction (correct snake_case for v1beta REST)
-            "system_instruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"parts": [
-                {"text": user_prompt},
-                {"inline_data": {"mime_type": "image/png", "data": b64}},
-            ]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
-        },
-        {  # attempt 2 fallback: system prompt merged into user text
-            "contents": [{"parts": [
-                {"text": system_prompt + "\n\n" + user_prompt},
-                {"inline_data": {"mime_type": "image/png", "data": b64}},
-            ]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
-        },
-    ]
+
+    def shapes(budget):
+        return [
+            {  # attempt 1: system_instruction (correct snake_case for v1beta REST)
+                "system_instruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"parts": [
+                    {"text": user_prompt},
+                    {"inline_data": {"mime_type": "image/png", "data": b64}},
+                ]}],
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": budget},
+            },
+            {  # attempt 2 fallback: system prompt merged into user text
+                "contents": [{"parts": [
+                    {"text": system_prompt + "\n\n" + user_prompt},
+                    {"inline_data": {"mime_type": "image/png", "data": b64}},
+                ]}],
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": budget},
+            },
+        ]
+
     last_err = "unknown error"
-    for i, body in enumerate(bodies):
-        try:
-            r = requests.post(url, json=body, timeout=timeout)
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}: {r.text[:500]}"
-                if r.status_code == 400 and i == 0:
-                    continue  # retry with merged-prompt body
-                raise RuntimeError(last_err)
-            data = r.json()
-            cands = data.get("candidates") or []
-            if not cands:
-                # API-level block / empty
-                last_err = f"no candidates: {json.dumps(data)[:500]}"
-                raise RuntimeError(last_err)
-            parts = ((cands[0].get("content") or {}).get("parts")) or []
-            text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
-            if not text:
-                raise RuntimeError(f"empty text in response: {json.dumps(data)[:500]}")
-            return text
-        except RuntimeError:
-            if i == len(bodies) - 1:
-                raise
-            last_err = traceback.format_exc(limit=3)
-            continue
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            if i == len(bodies) - 1:
-                raise RuntimeError(last_err) from e
-            continue
+    # Thinking models can length-exhaust a small budget the same way Go
+    # thinkers do: escalate 1024 -> 4096 -> 8192 before giving up.
+    for budget in (1024, 4096, 8192):
+        for i, body in enumerate(shapes(budget)):
+            try:
+                r = requests.post(url, json=body, timeout=timeout)
+                if r.status_code != 200:
+                    last_err = f"HTTP {r.status_code}: {r.text[:500]}"
+                    if r.status_code == 400 and i == 0:
+                        continue  # retry with merged-prompt body
+                    raise RuntimeError(last_err)
+                data = r.json()
+                cands = data.get("candidates") or []
+                if not cands:
+                    # API-level block / empty
+                    last_err = f"no candidates: {json.dumps(data)[:500]}"
+                    raise RuntimeError(last_err)
+                parts = ((cands[0].get("content") or {}).get("parts")) or []
+                text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+                if not text:
+                    if (cands[0].get("finishReason") or "").upper() == "MAX_TOKENS":
+                        last_err = "length: output budget exhausted"
+                        break  # escalate budget
+                    raise RuntimeError(f"empty text in response: {json.dumps(data)[:500]}")
+                return text
+            except RuntimeError:
+                if i == len(shapes(budget)) - 1 and budget == 8192:
+                    raise
+                last_err = traceback.format_exc(limit=3)
+                continue
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                if i == len(shapes(budget)) - 1 and budget == 8192:
+                    raise RuntimeError(last_err) from e
+                continue
     raise RuntimeError(last_err)
 
 
@@ -799,6 +812,37 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
             assert tail == "thinking trace here", f"tail lost: {tail!r}"
         return "chat/resp/msg builders + parsers ok, effort=low"
 
+    def t_gemini_budget():
+        import requests as _R
+        budgets = []
+        real_post = _R.post
+
+        class _Resp:
+            def __init__(self, code, payload):
+                self.status_code = code
+                self.text = "" if code == 200 else "err"
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        def fake_post(url, json=None, timeout=None):
+            budgets.append(json["generationConfig"]["maxOutputTokens"])
+            if len(budgets) == 1:
+                return _Resp(200, {"candidates": [{"finishReason": "MAX_TOKENS",
+                                 "content": {"parts": []}}]})
+            return _Resp(200, {"candidates": [{"finishReason": "STOP",
+                             "content": {"parts": [{"text": "escalated-ok"}]}}]})
+
+        _R.post = fake_post
+        try:
+            out = analyze_with_gemini(b"x", "k", "m", "s", "h")
+        finally:
+            _R.post = real_post
+        assert out == "escalated-ok", f"no escalation: {out!r}"
+        assert budgets[0] == 1024 and budgets[1] == 4096, f"budgets: {budgets}"
+        return "length-exhaustion escalates 1024->4096"
+
     def t_go_param_strip():
         assert _unsupported_param("'temperature' is not supported") == "temperature"
         assert _unsupported_param("Unsupported parameter: 'top_p'") == "top_p"
@@ -880,6 +924,7 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
     check("api keys", t_key)
     check("go vision registry", t_go_registry)
     check("go payloads (effort low)", t_go_payload)
+    check("gemini budget escalation", t_gemini_budget)
     check("go param strip", t_go_param_strip)
     check("go endpoint map", t_go_endpoints)
     check("overlay themes", t_themes)
@@ -2947,10 +2992,11 @@ def get_theme(theme_id):
 # ---------------------------------------------------------------- GUI (imported lazily so --selftest stays light)
 
 def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=None):
+    import random
     from PIL import ImageGrab
-    from PySide6 import QtCore, QtGui, QtWidgets
-    from PySide6.QtCore import (QAbstractNativeEventFilter, QObject, QThread,
-                                Signal, QTimer, Qt, QRect, QPoint, QByteArray)
+    from PySide6 import QtGui, QtWidgets
+    from PySide6.QtCore import (QAbstractNativeEventFilter, QObject,
+                                Signal, QTimer, Qt, QRect, QPoint)
     from PySide6.QtGui import QCursor, QGuiApplication, QPixmap, QPainter, QColor, QPen, QActionGroup
     from PySide6.QtWidgets import (QApplication, QMainWindow, QDialog, QWidget,
                                    QVBoxLayout, QHBoxLayout, QLabel, QTextBrowser,
@@ -3008,6 +3054,9 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
         SETTINGS["log_analyses"] = LOG[0]
         save_settings(SETTINGS)
     OPACITY = float(cfg.get("overlay_opacity", 0.93))
+    # User factor around the 0.93 default: default leaves theme design
+    # untouched, a custom overlay_opacity scales every theme proportionally.
+    OPACITY_FACTOR = (OPACITY / 0.93) if OPACITY > 0 else 1.0
 
     # ---------------------------------------------------------- hotkey filter
     class HotkeySignaler(QObject):
@@ -3213,7 +3262,8 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
         def _place_bar(self):
             if self.sel is None:
                 return
-            bw, bh = 560, 40
+            bw = min(560, max(200, self.width() - 16))
+            bh = 40
             x = min(max(self.sel.left(), 8), max(8, self.width() - bw - 8))
             y = self.sel.bottom() + 10
             if y + bh > self.height() - 8:
@@ -3637,7 +3687,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self._extras_stop()
             self._theme = t
             self._theme_id = theme_id
-            self.setWindowOpacity(t["opacity"])
+            self.setWindowOpacity(min(1.0, t["opacity"] * OPACITY_FACTOR))
             self.setMinimumWidth(t["min_w"])
             self.setMaximumWidth(t["max_w"])
             self.setStyleSheet(t["qss"])
@@ -3753,7 +3803,6 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
                     pass
 
         def _eq_step(self):
-            import random
             for bar in self._eq_bars:
                 try:
                     bar.setFixedHeight(random.randint(6, 34))
@@ -3944,12 +3993,18 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
         return QRect(x1, y1, x2 - x1 + 1, y2 - y1 + 1)
 
     def start_snip():
-        if state["snip"] is not None:
+        existing = state["snip"]
+        if existing is not None:
             try:
-                state["snip"].raise_()
-                state["snip"].activateWindow()
+                if existing.isVisible():
+                    existing.raise_()
+                    existing.activateWindow()
+                    return
             except Exception:
                 pass
+            # Hidden (150ms confirm window): drop the stray press; the pending
+            # capture owns this cycle. Press again after it lands.
+            state["snip"] = None
             return
         w = SnipOverlay(virtual_geometry())
         state["snip"] = w
@@ -3966,22 +4021,32 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             state["cursor"] = QCursor.pos()
         except Exception:
             state["cursor"] = QPoint(x, y)
-        # capture (Pillow handles multi-monitor global coords)
+        # capture (Pillow handles multi-monitor global coords). Any failure
+        # here (locked screen, save error, teardown race) becomes an overlay
+        # error — never an unhandled slot exception.
         try:
-            img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
-        except TypeError:
-            img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if SAVE[0]:
-            os.makedirs(SNIPS_DIR, exist_ok=True)
-            png_path = os.path.join(SNIPS_DIR, f"snip_{ts}.png")
-            img.save(png_path, "PNG")
-            state["png_path"] = png_path
-        else:
-            state["png_path"] = "(snip saving off — image kept in memory only)"
-        buf = io.BytesIO()
-        img.save(buf, "PNG")
-        state["png"] = buf.getvalue()
+            try:
+                img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
+            except TypeError:
+                img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if SAVE[0]:
+                os.makedirs(SNIPS_DIR, exist_ok=True)
+                png_path = os.path.join(SNIPS_DIR, f"snip_{ts}.png")
+                img.save(png_path, "PNG")
+                state["png_path"] = png_path
+            else:
+                state["png_path"] = "(snip saving off — image kept in memory only)"
+            buf = io.BytesIO()
+            img.save(buf, "PNG")
+            state["png"] = buf.getvalue()
+        except Exception as e:
+            try:
+                overlay.show_error(f"capture failed: {type(e).__name__}: {e}",
+                                   logged=False)
+            except Exception:
+                pass
+            return
         run_analysis(state["cursor"])
 
     def on_done(payload):

@@ -12,7 +12,7 @@ carries `geometry` (w/h or orientation), `regions` (header/body/footer order),
 `qss` (full stylesheet), and `flags` (opacity, font, extras like scanlines).
 Switching = rebuild card widget + apply QSS. No config.json changes needed.
 
-**Status: ALL 60 themes IMPLEMENTED** (`THEMES` registry in app.py; tray-only
+**Status: ALL 65 themes IMPLEMENTED** (`THEMES` registry in app.py; tray-only
 Theme submenu; choice in `settings.json`). Nothing pending.
 
 ## C. Pass-2 catalogue additions (all implemented)
