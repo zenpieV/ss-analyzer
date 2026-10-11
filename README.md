@@ -78,6 +78,9 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
 - Tray icon appears. Press **Ctrl+LeftAlt+J** anywhere to snip.
 - Drag = select, drag inside = move, drag corners/edges = resize.
 - Enter / double-click / Analyze button = send. Esc / right-click = cancel.
+- Snip bar has an optional custom-prompt box beside Analyze: click it to type
+  (it never takes focus on its own). Enter sends the snip with your prompt,
+  Shift+Enter makes a newline; empty box = config `user_prompt`.
 - Result overlay appears near cursor (dark glass, 93% opacity): Copy / Open log / Close. Draggable by header.
 
 ## Notes

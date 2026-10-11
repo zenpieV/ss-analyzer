@@ -19,6 +19,38 @@ import uuid
 import traceback
 from ctypes import wintypes
 from datetime import datetime
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QPlainTextEdit
+
+
+class PromptBox(QPlainTextEdit):
+    """Optional per-snip custom prompt for the snip bar.
+
+    Click-to-focus ONLY (never steals focus when the bar appears):
+    plain Enter sends the snip with this text, Shift+Enter inserts a
+    newline, Escape cancels the snip. Empty text falls back to the
+    config user_prompt at send time.
+    """
+    send_requested = Signal()
+    cancel_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.ClickFocus)
+        self.setPlaceholderText(
+            "custom prompt (optional) — Enter sends, Shift+Enter newline")
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter) \
+                and not (e.modifiers() & Qt.ShiftModifier):
+            e.accept()
+            self.send_requested.emit()
+            return
+        if e.key() == Qt.Key_Escape:
+            e.accept()
+            self.cancel_requested.emit()
+            return
+        super().keyPressEvent(e)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
@@ -908,6 +940,33 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
         assert get_theme("nope")["label"] == "Obsidian Glass", "fallback broken"
         return f"{len(THEME_ORDER)} themes, engine fields ok"
 
+    def t_snip_prompt():
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtTest import QTest
+        from PySide6.QtCore import Qt as _Q
+        app = QApplication.instance() or QApplication([])
+        box = PromptBox()
+        assert box.focusPolicy() == _Q.ClickFocus, "box must be click-to-focus only"
+        hits = []
+        box.send_requested.connect(lambda: hits.append("send"))
+        box.cancel_requested.connect(lambda: hits.append("cancel"))
+        box.show()
+        box.setFocus()
+        QTest.keyClick(box, _Q.Key_A)
+        assert box.toPlainText() == "a", f"typing broken: {box.toPlainText()!r}"
+        QTest.keyClick(box, _Q.Key_Return, _Q.ShiftModifier)
+        assert box.toPlainText() == "a\n", \
+            f"shift+enter must newline: {box.toPlainText()!r}"
+        assert hits == [], f"shift+enter must not send: {hits}"
+        QTest.keyClick(box, _Q.Key_Return)
+        assert hits == ["send"], f"enter must send: {hits}"
+        assert box.toPlainText() == "a\n", "enter must not alter text"
+        QTest.keyClick(box, _Q.Key_Escape)
+        assert hits == ["send", "cancel"], f"esc must cancel: {hits}"
+        box.deleteLater()
+        app.processEvents()
+        return "click-focus; enter sends; shift+enter newline; esc cancels"
+
     def t_go_catalog_live():
         try:
             ids = fetch_go_catalog(timeout=15)
@@ -924,6 +983,7 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
     check("api keys", t_key)
     check("go vision registry", t_go_registry)
     check("go payloads (effort low)", t_go_payload)
+    check("snip custom prompt box", t_snip_prompt)
     check("gemini budget escalation", t_gemini_budget)
     check("go param strip", t_go_param_strip)
     check("go endpoint map", t_go_endpoints)
@@ -3126,7 +3186,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
     HANDLE = 10
 
     class SnipOverlay(QMainWindow):
-        confirmed = Signal(int, int, int, int)  # global x,y,w,h
+        confirmed = Signal(int, int, int, int, str)  # global x,y,w,h + custom prompt
         cancelled = Signal()
 
         def __init__(self, virtual_geo):
@@ -3148,15 +3208,21 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             lay.setContentsMargins(10, 6, 10, 6)
             hint = QLabel("drag: select  •  drag inside: move  •  drag corners: resize  •  Enter: analyze  •  Esc: cancel")
             hint.setObjectName("snipHint")
+            self.prompt_box = PromptBox()
+            self.prompt_box.setObjectName("snipPrompt")
+            self.prompt_box.setFixedHeight(26)
             self.btn_go = QPushButton("Analyze \u23ce")
             self.btn_go.setObjectName("snipGo")
             self.btn_no = QPushButton("Cancel")
             self.btn_no.setObjectName("snipNo")
             lay.addWidget(hint)
+            lay.addWidget(self.prompt_box, 1)
             lay.addWidget(self.btn_go)
             lay.addWidget(self.btn_no)
             self.btn_go.clicked.connect(self.accept_rect)
             self.btn_no.clicked.connect(self.reject)
+            self.prompt_box.send_requested.connect(self.accept_rect)
+            self.prompt_box.cancel_requested.connect(self.reject)
             self.bar.hide()
             self.setStyleSheet("""
                 #snipBar { background: rgba(16,20,28,235); border: 1px solid #7c9cff;
@@ -3165,6 +3231,9 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
                 #snipGo { background: #4f7cff; color: white; border: none;
                           border-radius: 7px; padding: 6px 14px; font-weight: 600; }
                 #snipGo:hover { background: #638bff; }
+                #snipPrompt { background: rgba(255,255,255,14); color: #e8ecf4;
+                              border: 1px solid #3a4358; border-radius: 7px;
+                              font-size: 12px; }
                 #snipNo { background: rgba(255,255,255,18); color: #e8ecf4;
                           border: 1px solid #3a4358; border-radius: 7px; padding: 6px 12px; }
                 #snipNo:hover { background: rgba(255,255,255,40); }
@@ -3262,7 +3331,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
         def _place_bar(self):
             if self.sel is None:
                 return
-            bw = min(560, max(200, self.width() - 16))
+            bw = min(760, max(320, self.width() - 16))
             bh = 40
             x = min(max(self.sel.left(), 8), max(8, self.width() - bw - 8))
             y = self.sel.bottom() + 10
@@ -3278,11 +3347,12 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
                 return
             g = self.sel.translated(self._origin)
             x, y, w, h = g.x(), g.y(), g.width(), g.height()
+            custom = self.prompt_box.toPlainText()
             # Hide BEFORE emitting: the confirmed handler captures the screen
             # synchronously, and our own border/handles must not be in the grab.
             self.hide()
             QApplication.processEvents()
-            QTimer.singleShot(150, lambda: self.confirmed.emit(x, y, w, h))
+            QTimer.singleShot(150, lambda: self.confirmed.emit(x, y, w, h, custom))
             self.close()
 
         def reject(self):
@@ -3843,21 +3913,21 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
 
     bridge = _Bridge()
 
-    def spawn_analysis(provider, model, png, session, gen):
+    def spawn_analysis(provider, model, png, session, gen, prompt):
         def work():
             try:
                 text = analyze_dispatch(provider, png,
                                         GEMINI_KEY[0], GO_KEY[0], model,
-                                        SYSTEM_PROMPT, USER_PROMPT,
+                                        SYSTEM_PROMPT, prompt,
                                         session_id=session)
             except Exception as e:
                 try:
-                    bridge.failed.emit((gen, str(e)))
+                    bridge.failed.emit((gen, str(e), prompt))
                 except Exception:
                     pass
                 return
             try:
-                bridge.done.emit((gen, text))
+                bridge.done.emit((gen, text, prompt))
             except Exception:
                 pass
         threading.Thread(target=work, daemon=True).start()
@@ -3913,10 +3983,11 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
         GEMINI_KEY[0] = res[0]
         GO_KEY[0] = res[1]
 
-    def run_analysis(cursor_pos):
+    def run_analysis(cursor_pos, prompt):
         overlay.show_loading(cursor_pos, state["bbox"])
         state["gen"] = state.get("gen", 0) + 1
-        spawn_analysis(PROVIDER[0], MODEL[0], state["png"], SESSION_ID, state["gen"])
+        spawn_analysis(PROVIDER[0], MODEL[0], state["png"], SESSION_ID,
+                       state["gen"], prompt)
 
     # tray (visual proof the app is running; quit lives here)
     tray = QSystemTrayIcon()
@@ -4014,9 +4085,11 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
         w.raise_()
         w.activateWindow()
 
-    def on_snip_confirmed(x, y, w, h):
+    def on_snip_confirmed(x, y, w, h, custom):
         state["snip"] = None
         state["bbox"] = (x, y, w, h)
+        # Custom per-snip prompt wins; empty box falls back to config.
+        prompt = (custom or "").strip() or USER_PROMPT
         try:
             state["cursor"] = QCursor.pos()
         except Exception:
@@ -4047,24 +4120,24 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             except Exception:
                 pass
             return
-        run_analysis(state["cursor"])
+        run_analysis(state["cursor"], prompt)
 
     def on_done(payload):
-        gen, text = payload
+        gen, text, prompt = payload
         if gen != state.get("gen"):
             return  # superseded by a newer snip
         if LOG[0]:
             append_log(LOG_PATH, MODEL[0], state["bbox"], state.get("png_path", ""),
-                       USER_PROMPT, text, provider=PROVIDER[0])
+                       prompt, text, provider=PROVIDER[0])
         overlay.show_result(text, logged=LOG[0])
 
     def on_failed(payload):
-        gen, err = payload
+        gen, err, prompt = payload
         if gen != state.get("gen"):
             return  # superseded by a newer snip
         if LOG[0]:
             append_log(LOG_PATH, MODEL[0], state["bbox"], state.get("png_path", ""),
-                       USER_PROMPT, "", error=err, provider=PROVIDER[0])
+                       prompt, "", error=err, provider=PROVIDER[0])
         overlay.show_error(err, logged=LOG[0])
 
     bridge.done.connect(on_done)
