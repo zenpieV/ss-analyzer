@@ -54,6 +54,29 @@ class PromptBox(QPlainTextEdit):
             return
         super().keyPressEvent(e)
 
+
+# Contrast-critical input styles — single source of truth, guarded by
+# t_ask_contrast across all 65 themes. Every text input carries an explicit
+# opaque bg + fg (+ selection) so no theme QSS or native/translucent paint
+# path can wash typed text out.
+ASK_QSS = ("#ask { background-color: #141821; color: #f2f5fb; "
+           "border: 1px solid #3a4358; border-radius: 7px; "
+           "padding: 2px 6px; font-size: 12px; "
+           "selection-background-color: #4f7cff; selection-color: white; }")
+SNIP_PROMPT_QSS = ("#snipPrompt { background: rgba(255,255,255,14); color: #e8ecf4; "
+                   "border: 1px solid #3a4358; border-radius: 7px; font-size: 12px; }")
+SNIP_BAR_QSS = ("""
+                #snipBar { background: rgba(16,20,28,235); border: 1px solid #7c9cff;
+                           border-radius: 10px; }
+                #snipHint { color: #c6cede; font-size: 12px; }
+                #snipGo { background: #4f7cff; color: white; border: none;
+                          border-radius: 7px; padding: 6px 14px; font-weight: 600; }
+                #snipGo:hover { background: #638bff; }
+                #snipNo { background: rgba(255,255,255,18); color: #e8ecf4;
+                          border: 1px solid #3a4358; border-radius: 7px; padding: 6px 12px; }
+                #snipNo:hover { background: rgba(255,255,255,40); }
+            """)
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DEFAULT_LOG = os.path.join(APP_DIR, "analyses.md")
@@ -1109,6 +1132,85 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
         app.processEvents()
         return "click-focus; enter sends; shift+enter newline; esc cancels"
 
+    def t_ask_contrast():
+        # Every text input renders typed text at >=7:1 against its box on
+        # every theme: grab both boxes per theme and measure WCAG contrast
+        # between the dominant (bg) and most-distant (text) pixel clusters.
+        from PySide6.QtWidgets import QApplication, QDialog, QFrame, QVBoxLayout
+        from PySide6.QtGui import QImage
+        from collections import Counter
+        app = QApplication.instance() or QApplication([])
+
+        def _lum(rgb):
+            def ch(c):
+                c /= 255.0
+                return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+            return 0.2126 * ch(rgb[0]) + 0.7152 * ch(rgb[1]) + 0.0722 * ch(rgb[2])
+
+        def _ratio(a, b):
+            hi, lo = max(_lum(a), _lum(b)), min(_lum(a), _lum(b))
+            return (hi + 0.05) / (lo + 0.05)
+
+        dlg = QDialog()
+        dlg.move(-10000, -10000)  # render without flashing on the desktop
+        lay = QVBoxLayout(dlg)
+        card = QFrame()
+        card.setObjectName("card")
+        clay = QVBoxLayout(card)
+        ask = PromptBox(click_only=False)
+        ask.setObjectName("ask")
+        ask.setFixedHeight(30)
+        ask.setStyleSheet(ASK_QSS)
+        ask.setPlainText("AgxQ7")
+        clay.addWidget(ask)
+        bar = QFrame()
+        bar.setObjectName("snipBar")
+        bar.setStyleSheet(SNIP_BAR_QSS)
+        blay = QVBoxLayout(bar)
+        pb = PromptBox()
+        pb.setObjectName("snipPrompt")
+        pb.setFixedHeight(26)
+        pb.setStyleSheet(SNIP_PROMPT_QSS)
+        pb.setPlainText("AgxQ7")
+        blay.addWidget(pb)
+        lay.addWidget(card)
+        lay.addWidget(bar)
+        dlg.show()
+        worst_a, worst_s = 99.0, 99.0
+        wtid_a, wtid_s = "?", "?"
+        for tid in THEME_ORDER:
+            dlg.setStyleSheet(THEMES[tid]["qss"])
+            app.processEvents()
+            for widget, kind in ((ask, "a"), (pb, "s")):
+                img = widget.grab().toImage().convertToFormat(
+                    QImage.Format.Format_RGB32)
+                cnt = Counter()
+                w, h = img.width(), img.height()
+                for y in range(h):
+                    for x in range(w):
+                        px = img.pixel(x, y)
+                        cnt[((px >> 16) & 255, (px >> 8) & 255, px & 255)] += 1
+                if len(cnt) < 3:
+                    dlg.deleteLater()
+                    return (f"WARN grab unsupported ({len(cnt)} colors) — "
+                            "eyeball contrast instead")
+                top = cnt.most_common(6)
+                bg, _ = top[0]
+                fg = max((c for c, _ in top[1:]),
+                         key=lambda c: sum(abs(a - b) for a, b in zip(c, bg)))
+                r = _ratio(bg, fg)
+                if kind == "a":
+                    if r < worst_a:
+                        worst_a, wtid_a = r, tid
+                elif r < worst_s:
+                    worst_s, wtid_s = r, tid
+        dlg.deleteLater()
+        app.processEvents()
+        assert worst_a >= 7.0, f"ask contrast {worst_a:.2f} on {wtid_a}"
+        assert worst_s >= 7.0, f"snip contrast {worst_s:.2f} on {wtid_s}"
+        return (f"65 themes >=7:1 (worst ask {wtid_a}={worst_a:.1f}, "
+                f"worst snip {wtid_s}={worst_s:.1f})")
+
     def t_go_catalog_live():
         try:
             ids = fetch_go_catalog(timeout=15)
@@ -1126,6 +1228,7 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
     check("go vision registry", t_go_registry)
     check("go payloads (effort low)", t_go_payload)
     check("follow-up history builders", t_followup_history)
+    check("input contrast all themes", t_ask_contrast)
     check("snip custom prompt box", t_snip_prompt)
     check("gemini budget escalation", t_gemini_budget)
     check("go param strip", t_go_param_strip)
@@ -3354,6 +3457,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self.prompt_box = PromptBox()
             self.prompt_box.setObjectName("snipPrompt")
             self.prompt_box.setFixedHeight(26)
+            self.prompt_box.setStyleSheet(SNIP_PROMPT_QSS)
             self.btn_go = QPushButton("Analyze \u23ce")
             self.btn_go.setObjectName("snipGo")
             self.btn_no = QPushButton("Cancel")
@@ -3367,20 +3471,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self.prompt_box.send_requested.connect(self.accept_rect)
             self.prompt_box.cancel_requested.connect(self.reject)
             self.bar.hide()
-            self.setStyleSheet("""
-                #snipBar { background: rgba(16,20,28,235); border: 1px solid #7c9cff;
-                           border-radius: 10px; }
-                #snipHint { color: #c6cede; font-size: 12px; }
-                #snipGo { background: #4f7cff; color: white; border: none;
-                          border-radius: 7px; padding: 6px 14px; font-weight: 600; }
-                #snipGo:hover { background: #638bff; }
-                #snipPrompt { background: rgba(255,255,255,14); color: #e8ecf4;
-                              border: 1px solid #3a4358; border-radius: 7px;
-                              font-size: 12px; }
-                #snipNo { background: rgba(255,255,255,18); color: #e8ecf4;
-                          border: 1px solid #3a4358; border-radius: 7px; padding: 6px 12px; }
-                #snipNo:hover { background: rgba(255,255,255,40); }
-            """)
+            self.setStyleSheet(SNIP_BAR_QSS)
 
         # -- geometry helpers (widget-local <-> global)
         def _to_local(self, gp):
@@ -3713,11 +3804,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self.ask_box = PromptBox(click_only=False)
             self.ask_box.setObjectName("ask")
             self.ask_box.setFixedHeight(30)
-            # Palette default (white box, dark text) reads on every theme;
-            # only shape is forced so themed cards keep their look.
-            self.ask_box.setStyleSheet(
-                "#ask { border: 1px solid #3a4358; border-radius: 7px; "
-                "padding: 2px 6px; font-size: 12px; }")
+            self.ask_box.setStyleSheet(ASK_QSS)
             self.ask_send = QPushButton("Ask")
             self.ask_send.setObjectName("btn")
             al.addWidget(self.ask_box, 1)
