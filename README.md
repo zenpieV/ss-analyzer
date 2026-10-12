@@ -27,7 +27,7 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
     `reasoning_effort`/`reasoning.effort=low` on chat+responses (bare retry on 400),
     tight `max_tokens` cap on messages. Every Go request sends a stable
     `x-opencode-session` id (one per app run, for gateway routing/cache) and
-    `User-Agent: ss-analyzer/1.0`, as the Go docs require.
+    `User-Agent: ss-analyzer/1.1`, as the Go docs require.
 - Model switcher: overlay dropdown header + tray right-click **Model** submenu
   (family-separated, exclusive). Switching applies to the next analysis and
   persists to `config.json` (selection fields only — your keys/model list are yours).

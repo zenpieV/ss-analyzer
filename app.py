@@ -57,7 +57,7 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DEFAULT_LOG = os.path.join(APP_DIR, "analyses.md")
 SNIPS_DIR = os.path.join(APP_DIR, "snips")
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 HOTKEY_ID = 1
 MOD_ALT = 0x0001
@@ -81,7 +81,7 @@ GO_CHAT_URL = GO_BASE + "/chat/completions"
 GO_RESP_URL = GO_BASE + "/responses"
 GO_MSG_URL = GO_BASE + "/messages"
 GO_MODELS_URL = GO_BASE + "/models"
-GO_UA = "ss-analyzer/1.0"
+GO_UA = "ss-analyzer/1.1"
 GO_EFFORT = "low"  # reasoning-effort equivalent applied to every Go request
 GO_429_RETRY_SECONDS = 0  # delayed retry after a 429; 0 = DISABLED for now (set e.g. 20 to re-enable)
 # Per-model wire protocol, from the Go docs endpoint table
@@ -941,7 +941,7 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
         return f"{len(THEME_ORDER)} themes, engine fields ok"
 
     def t_snip_prompt():
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
         from PySide6.QtTest import QTest
         from PySide6.QtCore import Qt as _Q
         app = QApplication.instance() or QApplication([])
@@ -964,6 +964,17 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
         QTest.keyClick(box, _Q.Key_Escape)
         assert hits == ["send", "cancel"], f"esc must cancel: {hits}"
         box.deleteLater()
+        # focus contract: no steal on show, focus on click
+        win = QWidget()
+        lay = QVBoxLayout(win)
+        box2 = PromptBox()
+        lay.addWidget(box2)
+        win.show()
+        app.processEvents()
+        assert QApplication.focusWidget() is not box2, "box stole focus on show"
+        QTest.mouseClick(box2, _Q.LeftButton)
+        assert box2.hasFocus(), "click must focus the box"
+        win.deleteLater()
         app.processEvents()
         return "click-focus; enter sends; shift+enter newline; esc cancels"
 
