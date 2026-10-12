@@ -34,9 +34,11 @@ class PromptBox(QPlainTextEdit):
     send_requested = Signal()
     cancel_requested = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, click_only=True):
         super().__init__(parent)
-        self.setFocusPolicy(Qt.ClickFocus)
+        # Snip bar: click-to-focus only, never steals focus on show.
+        # Result overlay ask-box: full focus so it can be autotargeted.
+        self.setFocusPolicy(Qt.ClickFocus if click_only else Qt.StrongFocus)
         self.setPlaceholderText(
             "custom prompt (optional) — Enter sends, Shift+Enter newline")
 
@@ -57,7 +59,7 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DEFAULT_LOG = os.path.join(APP_DIR, "analyses.md")
 SNIPS_DIR = os.path.join(APP_DIR, "snips")
 
-VERSION = "1.1"
+VERSION = "1.3"
 
 HOTKEY_ID = 1
 MOD_ALT = 0x0001
@@ -68,6 +70,34 @@ WM_HOTKEY = 0x0312
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"  # free-tier Flash-Lite id (2.5 ids are gated to past users), overridable
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+HISTORY_LIMIT = 12  # neutral (role, text) entries cap on the wire; transcript keeps all
+
+
+def _trim_history(chat, limit=HISTORY_LIMIT):
+    """Trim oldest turns for the wire, keeping (user, assistant) pairs aligned
+    so a trimmed history never ends with a dangling user turn."""
+    chat = list(chat or [])
+    while len(chat) > limit:
+        if len(chat) >= 2 and chat[0][0] == "user" and chat[1][0] == "assistant":
+            del chat[:2]
+        else:
+            del chat[:1]
+    return chat
+
+
+def _transcript(chat):
+    """Render neutral history for the overlay: bare answer for a single turn,
+    labeled Q/A blocks once follow-ups exist."""
+    chat = list(chat or [])
+    if len(chat) <= 2:
+        return chat[1][1] if len(chat) == 2 else ""
+    bits = []
+    for i in range(0, len(chat) - 1, 2):
+        q = chat[i][1] if chat[i][0] == "user" else ""
+        a = chat[i + 1][1] if chat[i + 1][0] == "assistant" else ""
+        bits.append(f"\u276f {q}\n{a}")
+    return "\n\n".join(bits)
 
 # ---------------------------------------------------------------- OpenCode Go
 # Go gateway: OpenAI-compatible chat/completions, Bearer <Go key>.
@@ -81,7 +111,7 @@ GO_CHAT_URL = GO_BASE + "/chat/completions"
 GO_RESP_URL = GO_BASE + "/responses"
 GO_MSG_URL = GO_BASE + "/messages"
 GO_MODELS_URL = GO_BASE + "/models"
-GO_UA = "ss-analyzer/1.1"
+GO_UA = "ss-analyzer/1.3"
 GO_EFFORT = "low"  # reasoning-effort equivalent applied to every Go request
 GO_429_RETRY_SECONDS = 0  # delayed retry after a 429; 0 = DISABLED for now (set e.g. 20 to re-enable)
 # Per-model wire protocol, from the Go docs endpoint table
@@ -358,31 +388,50 @@ def append_log(path, model, bbox, image_path, prompt, output, error=None, provid
     return path
 
 
+def append_followup(path, question, answer, error=None):
+    ensure_log(path)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"- follow-up: {question}\n\n"
+                    f"```text\n{(error or answer or '(empty)').strip()}\n```\n\n---\n")
+    except Exception as e:
+        print(f"[log] warning: cannot append to log: {e}")
+    return path
+
+
 # ---------------------------------------------------------------- Gemini client (requests, no extra SDK)
 
-def analyze_with_gemini(image_bytes, api_key, model, system_prompt, user_prompt, timeout=60):
+def analyze_with_gemini(image_bytes, api_key, model, system_prompt, user_prompt,
+                        timeout=60, history=None):
     import requests
     if not (api_key or "").strip():
         raise RuntimeError("No GEMINI_API_KEY set. Run: setx GEMINI_API_KEY \"your-key\" "
                            "(restart terminal), or put it in config.json > gemini_api_key.")
     url = GEMINI_URL.format(model=model) + f"?key={api_key}"
     b64 = base64.b64encode(image_bytes).decode("ascii")
+    prior = []
+    for role, text in (history or []):
+        prior.append({"role": "user" if role == "user" else "model",
+                      "parts": [{"text": text}]})
 
     def shapes(budget):
         return [
             {  # attempt 1: system_instruction (correct snake_case for v1beta REST)
                 "system_instruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"parts": [
+                "contents": prior + [{"parts": [
                     {"text": user_prompt},
                     {"inline_data": {"mime_type": "image/png", "data": b64}},
                 ]}],
                 "generationConfig": {"temperature": 0.2, "maxOutputTokens": budget},
             },
-            {  # attempt 2 fallback: system prompt merged into user text
-                "contents": [{"parts": [
-                    {"text": system_prompt + "\n\n" + user_prompt},
-                    {"inline_data": {"mime_type": "image/png", "data": b64}},
-                ]}],
+            {  # attempt 2 fallback: everything merged into one user turn
+                # (no roles here, so history joins as plain texts in order)
+                "contents": [{"parts":
+                    [{"text": system_prompt}]
+                    + [{"text": text} for _, text in (history or [])]
+                    + [{"inline_data": {"mime_type": "image/png", "data": b64}},
+                       {"text": user_prompt}],
+                }],
                 "generationConfig": {"temperature": 0.2, "maxOutputTokens": budget},
             },
         ]
@@ -490,24 +539,29 @@ def resolve_go_vision_models(cfg, live_ids=None):
 
 
 def build_go_payload(model, system_prompt, user_prompt, image_b64, with_effort=True,
-                     budget=4096):
-    return build_go_chat(model, system_prompt, user_prompt, image_b64, with_effort, budget)
+                     budget=4096, history=None):
+    return build_go_chat(model, system_prompt, user_prompt, image_b64, with_effort,
+                         budget, history)
 
 
 def build_go_chat(model, system_prompt, user_prompt, image_b64, with_effort=True,
-                  budget=4096):
+                  budget=4096, history=None):
+    msgs = [{"role": "system", "content": system_prompt}]
+    for role, text in (history or []):
+        msgs.append({"role": "user" if role == "user" else "assistant",
+                     "content": text})
+    msgs.append(
+        {"role": "user", "content": [
+            {"type": "text", "text": user_prompt},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_b64}},
+        ]},
+    )
     body = {
         "model": model,
         "stream": False,
         "temperature": 0.2,
         "max_tokens": budget,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [
-                {"type": "text", "text": user_prompt},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_b64}},
-            ]},
-        ],
+        "messages": msgs,
     }
     if with_effort:
         # effort-low equivalent; gateway normalizes per provider.
@@ -518,22 +572,28 @@ def build_go_chat(model, system_prompt, user_prompt, image_b64, with_effort=True
 
 
 def build_go_responses(model, system_prompt, user_prompt, image_b64, with_effort=True,
-                       budget=4096):
+                       budget=4096, history=None):
+    items = [
+        {"role": "system", "content": [
+            {"type": "input_text", "text": system_prompt}]},
+    ]
+    for role, text in (history or []):
+        items.append({"role": "user" if role == "user" else "assistant", "content": [
+            {"type": "input_text", "text": text}]})
+    items.append(
+        {"role": "user", "content": [
+            {"type": "input_text", "text": user_prompt},
+            {"type": "input_image",
+             "image_url": "data:image/png;base64," + image_b64},
+        ]},
+    )
     body = {
         "model": model,
         "stream": False,
         "store": False,
         "max_output_tokens": budget,
         "temperature": 0.2,
-        "input": [
-            {"role": "system", "content": [
-                {"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [
-                {"type": "input_text", "text": user_prompt},
-                {"type": "input_image",
-                 "image_url": "data:image/png;base64," + image_b64},
-            ]},
-        ],
+        "input": items,
     }
     if with_effort:
         body["reasoning"] = {"effort": GO_EFFORT}
@@ -541,23 +601,28 @@ def build_go_responses(model, system_prompt, user_prompt, image_b64, with_effort
 
 
 def build_go_messages(model, system_prompt, user_prompt, image_b64, with_effort=True,
-                      budget=4096):
+                      budget=4096, history=None):
     # Anthropic Messages wire format. No portable effort knob exists here;
     # effort-low is expressed via the tight max_tokens cap (+ low temperature).
     # `with_effort` kept for a uniform retry shape; body is already minimal.
+    msgs = []
+    for role, text in (history or []):
+        msgs.append({"role": "user" if role == "user" else "assistant", "content": [
+            {"type": "text", "text": text}]})
+    msgs.append(
+        {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64",
+             "media_type": "image/png", "data": image_b64}},
+            {"type": "text", "text": user_prompt},
+        ]},
+    )
     return {
         "model": model,
         "stream": False,
         "temperature": 0.2,
         "max_tokens": budget,
         "system": system_prompt,
-        "messages": [
-            {"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64",
-                 "media_type": "image/png", "data": image_b64}},
-                {"type": "text", "text": user_prompt},
-            ]},
-        ],
+        "messages": msgs,
     }
 
 
@@ -663,7 +728,7 @@ def _unsupported_param(err_text):
 
 
 def analyze_with_go(image_bytes, api_key, model, system_prompt, user_prompt,
-                    session_id="", timeout=90):
+                    session_id="", timeout=90, history=None):
     import requests
     if not (api_key or "").strip():
         raise RuntimeError("No OpenCode Go key set. Run: setx OPENCODE_GO_API_KEY \"your-key\" "
@@ -686,7 +751,8 @@ def analyze_with_go(image_bytes, api_key, model, system_prompt, user_prompt,
         # max_completion_tokens where demanded. Caps the whole family.
         for start_bare in (False, True):
             body = builders[endpoint](model, system_prompt, user_prompt, b64,
-                                      with_effort=not start_bare, budget=budget)
+                                      with_effort=not start_bare, budget=budget,
+                                      history=history)
             for _ in range(5):  # strip loop
                 try:
                     r = requests.post(go_url_for(endpoint), headers=headers, json=body, timeout=timeout)
@@ -743,11 +809,12 @@ def _friendly_go_error(err):
 
 
 def analyze_dispatch(provider, image_bytes, gemini_key, go_key, model,
-                      system_prompt, user_prompt, session_id=""):
+                       system_prompt, user_prompt, session_id="", history=None):
     if provider == "go":
         return analyze_with_go(image_bytes, go_key, model, system_prompt, user_prompt,
-                               session_id=session_id)
-    return analyze_with_gemini(image_bytes, gemini_key, model, system_prompt, user_prompt)
+                               session_id=session_id, history=history)
+    return analyze_with_gemini(image_bytes, gemini_key, model, system_prompt, user_prompt,
+                               history=history)
 
 
 # ---------------------------------------------------------------- selftest (no GUI needed)
@@ -875,6 +942,70 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
         assert budgets[0] == 1024 and budgets[1] == 4096, f"budgets: {budgets}"
         return "length-exhaustion escalates 1024->4096"
 
+    def t_followup_history():
+        hist = [("user", "q0"), ("assistant", "a0"), ("user", "q1"), ("assistant", "a1")]
+        # trim keeps pairs aligned, newest kept
+        long = [(r, f"{t}{i}") for i in range(8) for r, t in (("user", "q"), ("assistant", "a"))]
+        trimmed = _trim_history(long)
+        assert len(trimmed) == HISTORY_LIMIT, f"trim len: {len(trimmed)}"
+        assert trimmed[0][0] == "user" and trimmed[-1][0] == "assistant", \
+            f"dangling turn: {trimmed[0][0]}..{trimmed[-1][0]}"
+        assert _trim_history([]) == [] and _trim_history(hist) == hist
+        # transcript: bare answer single-turn, labeled blocks after
+        assert _transcript([("user", "q0"), ("assistant", "a0")]) == "a0"
+        tr = _transcript(hist)
+        assert tr.count("\u276f ") == 2 and "a1" in tr, f"transcript: {tr!r}"
+        # chat wire: system + history + final(user text + image, image only here)
+        chat = build_go_chat("m", "sys", "q2", "QUJD", history=hist)
+        roles = [m["role"] for m in chat["messages"]]
+        assert roles == ["system", "user", "assistant", "user", "assistant", "user"], roles
+        assert chat["messages"][1]["content"] == "q0", "history user must be plain text"
+        final = chat["messages"][-1]["content"]
+        assert any(p.get("type") == "image_url" for p in final), "image missing on final"
+        assert sum("image_url" in json.dumps(m) for m in chat["messages"][:-1]) == 0, \
+            "image leaked into history"
+        # responses wire
+        resp = build_go_responses("m", "sys", "q2", "QUJD", history=hist)
+        assert resp["input"][0]["role"] == "system"
+        assert resp["input"][1] == {"role": "user",
+                                    "content": [{"type": "input_text", "text": "q0"}]}
+        assert resp["input"][-2] == {"role": "assistant",
+                                     "content": [{"type": "input_text", "text": "a1"}]}
+        # messages wire: system stays top-level
+        msg = build_go_messages("m", "sys", "q2", "QUJD", history=hist)
+        assert msg["system"] == "sys" and len(msg["messages"]) == 5, \
+            f"msg turns: {len(msg['messages'])}"
+        assert msg["messages"][-1]["content"][0]["type"] == "image"
+        assert msg["messages"][1] == {"role": "assistant",
+                                      "content": [{"type": "text", "text": "a0"}]}
+        # gemini wire via mocked post
+        import requests as _R
+        seen = []
+        real_post = _R.post
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"candidates": [{"finishReason": "STOP",
+                         "content": {"parts": [{"text": "r2"}]}}]}
+
+        def fake_post(url, json=None, timeout=None):
+            seen.append(json["contents"])
+            return _Resp()
+
+        _R.post = fake_post
+        try:
+            out = analyze_with_gemini(b"x", "k", "m", "s", "q2", history=hist)
+        finally:
+            _R.post = real_post
+        assert out == "r2", f"no reply: {out!r}"
+        roles = [c.get("role", "user") for c in seen[0]]
+        assert roles == ["user", "model", "user", "model", "user"], roles
+        assert "inline_data" in json.dumps(seen[0][-1]), "image missing on final"
+        assert "inline_data" not in json.dumps(seen[0][:-1]), "image leaked into history"
+        return "4 wire shapes carry history; trim pair-aligned; transcript labeled"
+
     def t_go_param_strip():
         assert _unsupported_param("'temperature' is not supported") == "temperature"
         assert _unsupported_param("Unsupported parameter: 'top_p'") == "top_p"
@@ -994,6 +1125,7 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
     check("api keys", t_key)
     check("go vision registry", t_go_registry)
     check("go payloads (effort low)", t_go_payload)
+    check("follow-up history builders", t_followup_history)
     check("snip custom prompt box", t_snip_prompt)
     check("gemini budget escalation", t_gemini_budget)
     check("go param strip", t_go_param_strip)
@@ -3067,7 +3199,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
     from PIL import ImageGrab
     from PySide6 import QtGui, QtWidgets
     from PySide6.QtCore import (QAbstractNativeEventFilter, QObject,
-                                Signal, QTimer, Qt, QRect, QPoint)
+                                Signal, QTimer, Qt, QRect, QPoint, QEvent)
     from PySide6.QtGui import QCursor, QGuiApplication, QPixmap, QPainter, QColor, QPen, QActionGroup
     from PySide6.QtWidgets import (QApplication, QMainWindow, QDialog, QWidget,
                                    QVBoxLayout, QHBoxLayout, QLabel, QTextBrowser,
@@ -3574,6 +3706,27 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self.footerW = QWidget()
             self.footerW.setLayout(fl)
             lay.addWidget(self.footerW)
+            # follow-up row (hidden until the first successful result; same
+            # Enter/Shift+Enter/Esc contract as the snip prompt box)
+            al = QHBoxLayout()
+            al.setContentsMargins(0, 2, 0, 0)
+            self.ask_box = PromptBox(click_only=False)
+            self.ask_box.setObjectName("ask")
+            self.ask_box.setFixedHeight(30)
+            # Palette default (white box, dark text) reads on every theme;
+            # only shape is forced so themed cards keep their look.
+            self.ask_box.setStyleSheet(
+                "#ask { border: 1px solid #3a4358; border-radius: 7px; "
+                "padding: 2px 6px; font-size: 12px; }")
+            self.ask_send = QPushButton("Ask")
+            self.ask_send.setObjectName("btn")
+            al.addWidget(self.ask_box, 1)
+            al.addWidget(self.ask_send)
+            self.askW = QWidget()
+            self.askW.setLayout(al)
+            lay.addWidget(self.askW)
+            self.askW.hide()
+            self.ask_box.installEventFilter(self)
             self.tear_top = QLabel(("\u25b2 " * 40).strip())
             self.tear_top.setObjectName("tear")
             self.tear_top.setAlignment(Qt.AlignCenter)
@@ -3671,6 +3824,18 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self._drag = None
             super().mouseReleaseEvent(e)
 
+        def eventFilter(self, obj, e):
+            # Autohide must not fire while the user is typing a follow-up.
+            try:
+                if obj is self.ask_box:
+                    if e.type() == QEvent.FocusIn:
+                        self._hide_timer.stop()
+                    elif e.type() == QEvent.FocusOut:
+                        self._arm_autohide()
+            except Exception:
+                pass
+            return super().eventFilter(obj, e)
+
         def place_near(self, pos):
             self.adjustSize()
             w, h = self.width() or 420, self.height() or 300
@@ -3685,6 +3850,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self._reveal_stop()
             self._hide_timer.stop()
             self._extras_stop()
+            self.askW.hide()
             self.body.setPlainText("")
             self.spin.show()
             if self._theme.get("eq"):
@@ -3722,9 +3888,34 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
                 self._reveal_timer.start(40)
             self.status.setText(self._status_text(
                 logged, "saved to analyses.md", "logging off (tray menu)"))
+            self.ask_box.setEnabled(True)
+            self.ask_send.setEnabled(True)
+            self.askW.show()
             self.show()
             self.raise_()
+            self.ask_box.setFocus()
             self._arm_autohide()
+
+        def show_thinking(self, status_text="Thinking …"):
+            # Follow-up in flight: keep the transcript, spin, lock the ask row.
+            self._hide_timer.stop()
+            self.spin.show()
+            self.status.setText(status_text)
+            self.ask_box.setEnabled(False)
+            self.ask_send.setEnabled(False)
+            self.show()
+            self.raise_()
+
+        def show_followup_error(self, err):
+            # Failed follow-up: transcript stays, ask text kept for one-Enter retry.
+            self._hide_timer.stop()
+            self.spin.hide()
+            self.status.setText(f"follow-up failed: {err[:160]}")
+            self.ask_box.setEnabled(True)
+            self.ask_send.setEnabled(True)
+            self.show()
+            self.raise_()
+            self.ask_box.setFocus()
 
         def _status_text(self, logged, saved_bit, off_bit):
             base = self._theme.get("status_ok")
@@ -3739,6 +3930,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self._text = text
             self._reveal_stop()
             self._extras_stop()
+            self.askW.hide()
             self.spin.hide()
             self.body.setPlainText("ANALYSIS FAILED\n\n" + text)
             err = self._theme.get("status_err")
@@ -3924,13 +4116,13 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
 
     bridge = _Bridge()
 
-    def spawn_analysis(provider, model, png, session, gen, prompt):
+    def spawn_analysis(provider, model, png, session, gen, prompt, history=None):
         def work():
             try:
                 text = analyze_dispatch(provider, png,
                                         GEMINI_KEY[0], GO_KEY[0], model,
                                         SYSTEM_PROMPT, prompt,
-                                        session_id=session)
+                                        session_id=session, history=history)
             except Exception as e:
                 try:
                     bridge.failed.emit((gen, str(e), prompt))
@@ -3950,7 +4142,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
     overlay = ResultOverlay(SELECTIONS, PROVIDER[0], MODEL[0])
     overlay.apply_theme(THEME[0], LABELS.get((PROVIDER[0], MODEL[0]), MODEL[0]))
     state = {"snip": None, "gen": 0, "bbox": None, "cursor": None,
-             "png": b"", "png_path": ""}
+             "png": b"", "png_path": "", "chat": [], "busy": False}
 
     # ---- model selection: single source of truth, both switchers sync here
     tray_actions = {}  # (provider, model) -> QAction
@@ -3994,11 +4186,11 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
         GEMINI_KEY[0] = res[0]
         GO_KEY[0] = res[1]
 
-    def run_analysis(cursor_pos, prompt):
+    def run_analysis(cursor_pos, prompt, history=None):
         overlay.show_loading(cursor_pos, state["bbox"])
         state["gen"] = state.get("gen", 0) + 1
         spawn_analysis(PROVIDER[0], MODEL[0], state["png"], SESSION_ID,
-                       state["gen"], prompt)
+                       state["gen"], prompt, history)
 
     # tray (visual proof the app is running; quit lives here)
     tray = QSystemTrayIcon()
@@ -4099,6 +4291,8 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
     def on_snip_confirmed(x, y, w, h, custom):
         state["snip"] = None
         state["bbox"] = (x, y, w, h)
+        state["chat"] = []
+        state["busy"] = False
         # Custom per-snip prompt wins; empty box falls back to config.
         prompt = (custom or "").strip() or USER_PROMPT
         try:
@@ -4133,28 +4327,56 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             return
         run_analysis(state["cursor"], prompt)
 
+    def submit_followup():
+        q = overlay.ask_box.toPlainText().strip()
+        if not q or state.get("busy") or not state.get("png"):
+            return
+        state["busy"] = True
+        overlay.show_thinking("Thinking …")
+        state["gen"] = state.get("gen", 0) + 1
+        spawn_analysis(PROVIDER[0], MODEL[0], state["png"], SESSION_ID,
+                       state["gen"], q, _trim_history(state["chat"]))
+
     def on_done(payload):
         gen, text, prompt = payload
         if gen != state.get("gen"):
             return  # superseded by a newer snip
+        state["busy"] = False
+        first = not state["chat"]
+        state["chat"] += [("user", prompt), ("assistant", text)]
         if LOG[0]:
-            append_log(LOG_PATH, MODEL[0], state["bbox"], state.get("png_path", ""),
-                       prompt, text, provider=PROVIDER[0])
-        overlay.show_result(text, logged=LOG[0])
+            if first:
+                append_log(LOG_PATH, MODEL[0], state["bbox"], state.get("png_path", ""),
+                           prompt, text, provider=PROVIDER[0])
+            else:
+                append_followup(LOG_PATH, prompt, text)
+        if not first:
+            overlay.ask_box.clear()
+        overlay.show_result(_transcript(state["chat"]), logged=LOG[0])
 
     def on_failed(payload):
         gen, err, prompt = payload
         if gen != state.get("gen"):
             return  # superseded by a newer snip
+        state["busy"] = False
         if LOG[0]:
-            append_log(LOG_PATH, MODEL[0], state["bbox"], state.get("png_path", ""),
-                       prompt, "", error=err, provider=PROVIDER[0])
-        overlay.show_error(err, logged=LOG[0])
+            if not state["chat"]:
+                append_log(LOG_PATH, MODEL[0], state["bbox"], state.get("png_path", ""),
+                           prompt, "", error=err, provider=PROVIDER[0])
+            else:
+                append_followup(LOG_PATH, prompt, "", error=err)
+        if not state["chat"]:
+            overlay.show_error(err, logged=LOG[0])
+        else:
+            # Transcript stays; ask text kept for a one-Enter retry.
+            overlay.show_followup_error(err)
 
     bridge.done.connect(on_done)
     bridge.failed.connect(on_failed)
 
     overlay.model_chosen.connect(lambda p, m: set_selection(p, m))
+    overlay.ask_box.send_requested.connect(submit_followup)
+    overlay.ask_send.clicked.connect(submit_followup)
     signaler.pressed.connect(start_snip)
     act_snip.triggered.connect(start_snip)
     act_log.triggered.connect(overlay._open_log)

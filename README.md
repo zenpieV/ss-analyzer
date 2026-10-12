@@ -27,7 +27,7 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
     `reasoning_effort`/`reasoning.effort=low` on chat+responses (bare retry on 400),
     tight `max_tokens` cap on messages. Every Go request sends a stable
     `x-opencode-session` id (one per app run, for gateway routing/cache) and
-    `User-Agent: ss-analyzer/1.1`, as the Go docs require.
+    `User-Agent: ss-analyzer/1.3`, as the Go docs require.
 - Model switcher: overlay dropdown header + tray right-click **Model** submenu
   (family-separated, exclusive). Switching applies to the next analysis and
   persists to `config.json` (selection fields only — your keys/model list are yours).
@@ -81,6 +81,10 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
 - Snip bar has an optional custom-prompt box beside Analyze: click it to type
   (it never takes focus on its own). Enter sends the snip with your prompt,
   Shift+Enter makes a newline; empty box = config `user_prompt`.
+- Follow-ups: after a result lands, an ask row appears under it. Type and Enter
+  to ask about the same snip (image re-attached, last 12 turns kept on the wire).
+  Empty sends are ignored; the row locks while a turn is in flight; failed
+  turns keep your text for a one-Enter retry. Follow-ups log under the same entry.
 - Result overlay appears near cursor (dark glass, 93% opacity): Copy / Open log / Close. Draggable by header.
 
 ## Notes
