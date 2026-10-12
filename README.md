@@ -82,9 +82,11 @@ Global-hotkey screenshot snip -> analyzer model -> overlay near cursor + single-
   (it never takes focus on its own). Enter sends the snip with your prompt,
   Shift+Enter makes a newline; empty box = config `user_prompt`.
 - Follow-ups: after a result lands, an ask row appears under it. Type and Enter
-  to ask about the same snip (image re-attached, last 12 turns kept on the wire).
+  to ask about the same snip (image re-attached, last 12   turns kept on the wire).
   Empty sends are ignored; the row locks while a turn is in flight; failed
   turns keep your text for a one-Enter retry. Follow-ups log under the same entry.
+  The ask box is styled from the active theme's own colors (measured ≥ WCAG AA
+  on all 65 themes).
 - Result overlay appears near cursor (dark glass, 93% opacity): Copy / Open log / Close. Draggable by header.
 
 ## Notes

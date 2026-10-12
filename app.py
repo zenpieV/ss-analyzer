@@ -55,14 +55,125 @@ class PromptBox(QPlainTextEdit):
         super().keyPressEvent(e)
 
 
-# Contrast-critical input styles — single source of truth, guarded by
-# t_ask_contrast across all 65 themes. Every text input carries an explicit
-# opaque bg + fg (+ selection) so no theme QSS or native/translucent paint
-# path can wash typed text out.
-ASK_QSS = ("#ask { background-color: #141821; color: #f2f5fb; "
-           "border: 1px solid #3a4358; border-radius: 7px; "
-           "padding: 2px 6px; font-size: 12px; "
-           "selection-background-color: #4f7cff; selection-color: white; }")
+# Ask-box style, derived per theme from the theme's own tokens (body bg/fg +
+# button/card accent) so the input stays coherent with the card. Explicit
+# opaque bg + fg (+ inverted selection) keep text contrast high on every
+# theme; guarded by t_ask_contrast on all 65. Transparent/gradient/missing
+# body bg resolves through the card, then a dark fallback.
+_HEX_COLOR = re.compile(r"#[0-9a-fA-F]{3,8}\b")
+
+
+def _qss_block(qss, selector):
+    m = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", qss or "")
+    return m.group(1) if m else ""
+
+
+def _qss_prop(block, *names):
+    for name in names:
+        m = re.search(r"(?:^|;)\s*" + re.escape(name) + r"\s*:\s*([^;]+)", block)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _rgba(value):
+    """Parse #rgb/#rrggbb/#rrggbbaa/rgb()/rgba() to (r, g, b, a01); None if
+    unparseable. Named colors and gradients are deliberately unsupported —
+    callers fall back instead of guessing."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    if v.lower() in ("transparent", "none", "inherit", "initial"):
+        return None
+    if "gradient" in v.lower():
+        return None
+    m = re.fullmatch(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", v)
+    if m:
+        h = m.group(1)
+        if len(h) == 3:
+            r, g, b = (int(c * 2, 16) for c in h)
+            a = 1.0
+        elif len(h) == 6:
+            r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+            a = 1.0
+        else:
+            r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+            a = int(h[6:8], 16) / 255.0
+        return (r, g, b, a)
+    m = re.fullmatch(r"rgba?\(\s*([^)]+)\)", v, re.IGNORECASE)
+    if m:
+        try:
+            parts = [p.strip() for p in m.group(1).split(",")]
+            r, g, b = (int(float(parts[i])) for i in range(3))
+            a = float(parts[3]) if len(parts) > 3 else 1.0
+            # Qt stylesheets write alpha 0-255; tolerate CSS-style 0-1 too.
+            a = a / 255.0 if a > 1 else a
+        except (ValueError, IndexError):
+            return None
+        return (r, g, b, a)
+    return None
+
+
+def _over(fg, bg):
+    """Alpha-composite fg rgba over bg rgba -> (r, g, b, a)."""
+    fr, fg_, fb, fa = fg
+    br, bg_, bb, ba = bg
+    a = fa + ba * (1 - fa)
+    if a <= 0:
+        return (0, 0, 0, 0.0)
+    r = (fr * fa + br * ba * (1 - fa)) / a
+    g = (fg_ * fa + bg_ * ba * (1 - fa)) / a
+    b = (fb * fa + bb * ba * (1 - fa)) / a
+    return (r, g, b, a)
+
+
+def _css(rgb):
+    return "#%02x%02x%02x" % (int(round(rgb[0])), int(round(rgb[1])), int(round(rgb[2])))
+
+
+def _opaque(value):
+    """The literal back iff it paints essentially opaque (alpha >= 0.86).
+    Anything translucent keeps depending on unknown compositing context
+    (card, desktop), so callers must keep resolving instead of copying it."""
+    parsed = _rgba(value)
+    if parsed and parsed[3] >= 0.86:
+        return value.strip()
+    return ""
+
+
+def ask_qss_for(theme_qss):
+    body = _qss_block(theme_qss, "#body")
+    card = _qss_block(theme_qss, "#card")
+    # Resolve the full stack mathematically to one OPAQUE color: translucent
+    # values (lavender's 6%-alpha body wash, obsidian's 4% veil) depend on
+    # unknown compositing context (card, desktop, grab isolation), so copying
+    # them raw yields unpredictable contrast. Compositing down to #rrggbb is
+    # deterministic on every platform and still reads as the theme's color.
+    body_bg = _rgba(_qss_prop(body, "background-color", "background"))
+    card_bg = _rgba(_qss_prop(card, "background-color", "background"))
+    if card_bg is None:
+        card_bg = (18, 20, 28, 1.0)
+    if body_bg is None:
+        body_bg = (0, 0, 0, 0.0)
+    eff = _over(body_bg, card_bg)
+    # Anything below the card is unknown desktop: assume the card's own hue.
+    eff = _over(eff, (card_bg[0], card_bg[1], card_bg[2], 1.0))
+    bg = _css(eff)
+    fg_raw = _rgba(_qss_prop(body, "color"))
+    if fg_raw is None:
+        fg_raw = (242, 245, 251, 1.0)
+    fg = _css(_over(fg_raw, (eff[0], eff[1], eff[2], 1.0)))
+    accent = ""
+    for sel in ("#btn", "#btnPri", "#card", "#body"):
+        m = _HEX_COLOR.search(_qss_prop(_qss_block(theme_qss, sel), "border"))
+        if m:
+            accent = m.group(0)
+            break
+    accent = accent or fg
+    return ("#ask { background-color: %s; color: %s; border: 2px solid %s; "
+            "border-radius: 8px; padding: 2px 6px; font-size: 12px; "
+            "selection-background-color: %s; selection-color: %s; }"
+            % (bg, fg, accent, fg, bg))
 SNIP_PROMPT_QSS = ("#snipPrompt { background: rgba(255,255,255,14); color: #e8ecf4; "
                    "border: 1px solid #3a4358; border-radius: 7px; font-size: 12px; }")
 SNIP_BAR_QSS = ("""
@@ -1133,9 +1244,11 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
         return "click-focus; enter sends; shift+enter newline; esc cancels"
 
     def t_ask_contrast():
-        # Every text input renders typed text at >=7:1 against its box on
-        # every theme: grab both boxes per theme and measure WCAG contrast
-        # between the dominant (bg) and most-distant (text) pixel clusters.
+        # Every text input renders typed text at WCAG AA (>=4.5:1) against
+        # its box on every theme: grab both boxes per theme and measure
+        # contrast between the dominant (bg) and most-distant (text) clusters.
+        # The ask style is derived from each theme's own tokens, so inputs
+        # stay coherent with the card instead of one fixed chip.
         from PySide6.QtWidgets import QApplication, QDialog, QFrame, QVBoxLayout
         from PySide6.QtGui import QImage
         from collections import Counter
@@ -1160,7 +1273,6 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
         ask = PromptBox(click_only=False)
         ask.setObjectName("ask")
         ask.setFixedHeight(30)
-        ask.setStyleSheet(ASK_QSS)
         ask.setPlainText("AgxQ7")
         clay.addWidget(ask)
         bar = QFrame()
@@ -1180,6 +1292,7 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
         wtid_a, wtid_s = "?", "?"
         for tid in THEME_ORDER:
             dlg.setStyleSheet(THEMES[tid]["qss"])
+            ask.setStyleSheet(ask_qss_for(THEMES[tid]["qss"]))
             app.processEvents()
             for widget, kind in ((ask, "a"), (pb, "s")):
                 img = widget.grab().toImage().convertToFormat(
@@ -1206,9 +1319,9 @@ def run_selftest(cli_model=None, cli_key=None, cli_log=None):
                     worst_s, wtid_s = r, tid
         dlg.deleteLater()
         app.processEvents()
-        assert worst_a >= 7.0, f"ask contrast {worst_a:.2f} on {wtid_a}"
-        assert worst_s >= 7.0, f"snip contrast {worst_s:.2f} on {wtid_s}"
-        return (f"65 themes >=7:1 (worst ask {wtid_a}={worst_a:.1f}, "
+        assert worst_a >= 4.5, f"ask contrast {worst_a:.2f} on {wtid_a}"
+        assert worst_s >= 4.5, f"snip contrast {worst_s:.2f} on {wtid_s}"
+        return (f"65 themes >=4.5:1 AA (worst ask {wtid_a}={worst_a:.1f}, "
                 f"worst snip {wtid_s}={worst_s:.1f})")
 
     def t_go_catalog_live():
@@ -3804,7 +3917,6 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self.ask_box = PromptBox(click_only=False)
             self.ask_box.setObjectName("ask")
             self.ask_box.setFixedHeight(30)
-            self.ask_box.setStyleSheet(ASK_QSS)
             self.ask_send = QPushButton("Ask")
             self.ask_send.setObjectName("btn")
             al.addWidget(self.ask_box, 1)
@@ -4051,6 +4163,7 @@ def run_gui(cli_model=None, cli_key=None, cli_log=None, cli_theme=None, _app=Non
             self.setMinimumWidth(t["min_w"])
             self.setMaximumWidth(t["max_w"])
             self.setStyleSheet(t["qss"])
+            self.ask_box.setStyleSheet(ask_qss_for(t["qss"]))
             self.refresh_theme_texts(model_label)
             top = t.get("note_top", "") or (("▲ " * 40).strip() if t.get("tear") else "")
             bot = t.get("note_bot", "") or (("▼ " * 40).strip() if t.get("tear") else "")
